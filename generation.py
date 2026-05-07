@@ -120,6 +120,8 @@ class Llama:
             torch.set_default_tensor_type(torch.BFloat16Tensor)
         model = Transformer(model_args)
         model.load_state_dict(checkpoint, strict=False)
+        model.to(device)
+
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
 
         return Llama(model, tokenizer)
@@ -138,9 +140,6 @@ class Llama:
         logprobs: bool = False,
         echo: bool = False,
     ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
-        if max_gen_len == 0:
-            return prompt_tokens, None
-
         params = self.model.params
         bsz = len(prompt_tokens)
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
@@ -184,9 +183,9 @@ class Llama:
             )
             tokens[:, cur_pos] = next_token
             if logprobs:
-                token_logprobs[:, prev_pos + 1: cur_pos + 1] = -F.cross_entropy(
+                token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
                     input=logits.transpose(1, 2),
-                    target=tokens[:, prev_pos + 1: cur_pos + 1],
+                    target=tokens[:, prev_pos + 1 : cur_pos + 1],
                     reduction="none",
                     ignore_index=pad_id,
                 )
@@ -200,30 +199,33 @@ class Llama:
         if logprobs:
             token_logprobs = token_logprobs.tolist()
         out_tokens = []
+        out_logprobs = []
         for i, toks in enumerate(tokens.tolist()):
             # cut to max gen len
             start = 0 if echo else len(prompt_tokens[i])
-            toks = toks[start: len(prompt_tokens[i]) + max_gen_len]
+            toks = toks[start : len(prompt_tokens[i]) + max_gen_len]
+            probs = None
+            if logprobs:
+                probs = token_logprobs[i][start : len(prompt_tokens[i]) + max_gen_len]
             # cut to eos tok if any
             if self.tokenizer.eos_id in toks:
                 eos_idx = toks.index(self.tokenizer.eos_id)
                 toks = toks[:eos_idx]
+                probs = probs[:eos_idx] if logprobs else None
             out_tokens.append(toks)
-
-        return (out_tokens, token_logprobs if logprobs else None)
+            out_logprobs.append(probs)
+        return (out_tokens, out_logprobs if logprobs else None)
 
     @torch.inference_mode()
     def text_completion(
         self,
         prompts: List[str],
+        max_gen_len: int,
         temperature: float = 0.6,
         top_p: float = 0.9,
-        max_gen_len: Optional[int] = None,
         logprobs: bool = False,
         echo: bool = False,
     ) -> List[CompletionPrediction]:
-        if max_gen_len is None:
-            max_gen_len = self.model.params.max_seq_len - 1
         prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
         generation_tokens, generation_logprobs = self.generate(
             prompt_tokens=prompt_tokens,
@@ -242,36 +244,46 @@ class Llama:
                 }
                 for t, logprobs_i in zip(generation_tokens, generation_logprobs)
             ]
-        return [{"generation": self.tokenizer.decode(t)} for t in generation_tokens]
+        return [
+            {
+                "generation": self.tokenizer.decode(t),
+                "tokens": [self.tokenizer.decode(x) for x in t],
+            }
+            for t in generation_tokens
+        ]
 
     @torch.inference_mode()
     def chat_completion(
         self,
         dialogs: List[Dialog],
+        max_gen_len: int,
         temperature: float = 0.6,
         top_p: float = 0.9,
-        max_gen_len: Optional[int] = None,
         logprobs: bool = False,
     ) -> List[ChatPrediction]:
-        if max_gen_len is None:
-            max_gen_len = self.model.params.max_seq_len - 1
         prompt_tokens = []
+        unsafe_requests = []
         for dialog in dialogs:
+            unsafe_requests.append(
+                any([tag in msg["content"] for tag in SPECIAL_TAGS for msg in dialog])
+            )
+            if any(unsafe_requests[-1]):
+                continue
             if dialog[0]["role"] == "system":
                 dialog = [
-                             {
-                                 "role": dialog[1]["role"],
-                                 "content": B_SYS
-                                            + dialog[0]["content"]
-                                            + E_SYS
-                                            + dialog[1]["content"],
-                             }
-                         ] + dialog[2:]
+                    {
+                        "role": dialog[1]["role"],
+                        "content": B_SYS
+                        + dialog[0]["content"]
+                        + E_SYS
+                        + dialog[1]["content"],
+                    }
+                ] + dialog[2:]
             assert all([msg["role"] == "user" for msg in dialog[::2]]) and all(
                 [msg["role"] == "assistant" for msg in dialog[1::2]]
             ), (
                 "model only supports 'system', 'user' and 'assistant' roles, "
-                "starting with 'system' (optional) and alternating 'user'/'assistant' thereafter"
+                "starting with 'system', then 'user' and alternating (u/a/u/a/u...)"
             )
             dialog_tokens: List[int] = sum(
                 [
@@ -296,6 +308,7 @@ class Llama:
                 eos=False,
             )
             prompt_tokens.append(dialog_tokens)
+
         generation_tokens, generation_logprobs = self.generate(
             prompt_tokens=prompt_tokens,
             max_gen_len=max_gen_len,
@@ -309,20 +322,72 @@ class Llama:
                     "generation": {
                         "role": "assistant",
                         "content": self.tokenizer.decode(t),
+                        "destination": "",
                     },
                     "tokens": [self.tokenizer.decode(x) for x in t],
                     "logprobs": logprobs_i,
                 }
-                for t, logprobs_i in zip(generation_tokens, generation_logprobs)
+                if not unsafe
+                else {
+                    "generation": {
+                        "role": "assistant",
+                        "content": UNSAFE_ERROR,
+                        "destination": "",
+                    },
+                    "tokens": [],
+                    "logprobs": [],
+                }
+                for t, logprobs_i, unsafe in zip(
+                    generation_tokens, generation_logprobs, unsafe_requests
+                )
             ]
         return [
             {
                 "generation": {
                     "role": "assistant",
-                    "content": self.tokenizer.decode(t),
+                    "content": self.tokenizer.decode(t) if not unsafe else UNSAFE_ERROR,
+                    "destination": "",
                 },
+                "tokens": [self.tokenizer.decode(x) for x in t] if not unsafe else [],
             }
-            for t in generation_tokens
+            for t, unsafe in zip(generation_tokens, unsafe_requests)
+        ]
+
+    @torch.inference_mode()
+    def code_infilling(
+        self,
+        prefixes: List[str],
+        suffixes: List[str],
+        max_gen_len: int,
+        temperature: float = 0.6,
+        top_p: float = 0.9,
+        logprobs: bool = False,
+    ) -> List[InfillingPrediction]:
+        prompts = [
+            self.tokenizer.encode(
+                "<PRE> " + prefix.strip() + " <SUF> " + suffix.strip() + " <MID>",
+                bos=True,
+                eos=False,
+            )
+            for prefix, suffix in zip(prefixes, suffixes)
+        ]
+        generation_tokens, generation_logprobs = self.generate(
+            prompt_tokens=prompts,
+            max_gen_len=max_gen_len,
+            temperature=temperature,
+            top_p=top_p,
+            logprobs=logprobs,
+        )
+        return [
+            {
+                "generation": self.tokenizer.decode(
+                    generation_tokens[i][len(prompts[i]) :]
+                ),
+                "full_text": self.tokenizer.decode(generation_tokens[i]),
+                "tokens": [self.tokenizer.decode(x) for x in generation_tokens[i]],
+                "logprobs": generation_logprobs[i] if logprobs else None,
+            }
+            for i in range(len(generation_tokens))
         ]
 
 
